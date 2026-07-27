@@ -8,6 +8,7 @@ use std::io::{Seek, SeekFrom};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{
     env::home_dir,
     error::Error,
@@ -17,7 +18,8 @@ use std::{
     process::Command,
 };
 use tiny_http::{Header, HeaderField, Response, StatusCode};
-const MAX_AUTH_TRY_LIMIT: u8 = 3;
+
+const AUTH_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
@@ -112,11 +114,7 @@ fn log_debug(msg: &str) {
     }
 }
 
-fn server(
-    config: &Config,
-    sender: Sender<AuthResult>,
-    auth_failure_count: Arc<Mutex<u8>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn server(config: &Config, sender: Sender<AuthResult>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let server = tiny_http::Server::http(&config.bind_server)?;
     log_debug(&format!("Running Server on {}", server.server_addr()));
     loop {
@@ -132,19 +130,10 @@ fn server(
             req.respond(response.with_status_code(401))?;
             continue;
         };
-        let mut failures = auth_failure_count.lock().unwrap();
         if header.value == config.api_key {
             log_debug("auth approved");
             req.respond(response.with_status_code(200))?;
             sender.send(AuthResult::Approved)?;
-            break;
-        }
-        *failures += 1;
-        log_debug(&format!("auth failed, count={}", *failures));
-        if *failures >= MAX_AUTH_TRY_LIMIT {
-            log_debug("max auth attempts reached, timing out");
-            req.respond(response.with_status_code(401))?;
-            sender.send(AuthResult::TimedOut)?;
             break;
         }
         req.respond(response.with_status_code(401))?;
@@ -176,15 +165,22 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             return pam::ffi::PAM_AUTH_ERR;
         }
     };
-    let auth_failure_count = Arc::new(Mutex::new(0));
     let (tx, rx) = std::sync::mpsc::channel::<AuthResult>();
-    std::thread::spawn(move || match server(&config, tx, auth_failure_count) {
+    std::thread::spawn(move || match server(&config, tx) {
         Ok(_) => log_debug("server exited"),
         Err(e) => log_debug(&format!("server error: {e}")),
     });
-    match rx.recv() {
+
+    match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(AuthResult::Approved) => pam::ffi::PAM_SUCCESS,
         Ok(AuthResult::TimedOut) => pam::ffi::PAM_AUTH_ERR,
-        Err(_) => pam::ffi::PAM_AUTH_ERR,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            log_debug("authentication timed out");
+            pam::ffi::PAM_AUTH_ERR
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            log_debug("server thread exited unexpectedly");
+            pam::ffi::PAM_AUTH_ERR
+        }
     }
 }
