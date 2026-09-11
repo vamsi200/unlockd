@@ -1,13 +1,9 @@
-#![allow(unused)]
 use nanoid::alphabet::SAFE;
-use pam::{PamResponse, PamResult};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_char;
 use std::fmt;
 use std::io::{Seek, SeekFrom};
-use std::str::FromStr;
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 use std::{
     env::home_dir,
@@ -15,17 +11,15 @@ use std::{
     fmt::Display,
     fs::{OpenOptions, create_dir, exists},
     io::{Read, Write},
-    process::Command,
 };
-use tiny_http::{Header, HeaderField, Response, StatusCode};
+use tiny_http::{Response, StatusCode};
 
-const AUTH_TIMEOUT: Duration = Duration::from_secs(25);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
     bind_server: String,
     api_key: String,
-    allow_ips: Vec<String>,
 }
 
 impl Default for Config {
@@ -33,7 +27,6 @@ impl Default for Config {
         Self {
             bind_server: String::from("0.0.0.0:8892"),
             api_key: nanoid::nanoid!(16, &SAFE),
-            allow_ips: Vec::new(),
         }
     }
 }
@@ -42,13 +35,7 @@ impl Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Bind Server : {}", self.bind_server)?;
         writeln!(f, "API Key     : {}", self.api_key)?;
-        write!(f, "Allowed IPs : ")?;
-
-        if self.allow_ips.is_empty() {
-            write!(f, "<none>")
-        } else {
-            write!(f, "{}", self.allow_ips.join(", "))
-        }
+        Ok(())
     }
 }
 
@@ -171,7 +158,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         Err(e) => log_debug(&format!("server error: {e}")),
     });
 
-    match rx.recv_timeout(Duration::from_secs(10)) {
+    match rx.recv_timeout(AUTH_TIMEOUT) {
         Ok(AuthResult::Approved) => pam::ffi::PAM_SUCCESS,
         Ok(AuthResult::TimedOut) => pam::ffi::PAM_AUTH_ERR,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
